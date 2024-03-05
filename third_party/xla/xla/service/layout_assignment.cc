@@ -682,8 +682,9 @@ Status PropagateParameterLayoutToUsers(const HloInstruction* instruction,
 Status LayoutAssignment::AddMandatoryConstraints(
     ChannelLayoutConstraints* channel_constraints,
     LayoutConstraints* constraints) {
+  HloComputation* computation = constraints->computation();
   VLOG(2) << "Adding mandatory layout constraints to computation "
-          << constraints->computation()->name();
+          << computation->name();
 
   auto get_channel_constraints = [&](const HloInstruction* instruction) {
     return IsHostSendRecv(instruction) ? &host_channel_constraints_
@@ -692,7 +693,7 @@ Status LayoutAssignment::AddMandatoryConstraints(
 
   // Constrain layouts of instructions which define values with pre-existing
   // layouts.
-  for (auto* instruction : constraints->computation()->instructions()) {
+  for (auto* instruction : computation->instructions()) {
     if (instruction->opcode() == HloOpcode::kInfeed) {
       // Infeed layouts must match the layout of the original inserted
       // instruction.
@@ -709,9 +710,9 @@ Status LayoutAssignment::AddMandatoryConstraints(
                                           /*mandatory=*/true, /*dfs=*/true));
     } else if (instruction->opcode() == HloOpcode::kParameter) {
       if (reverse_computation_order_ ||
-          (constraints->computation()->IsEntryComputation() &&
+          (computation->IsEntryComputation() &&
            entry_computation_layout_->AnyLayoutSet()) ||
-          (conditional_mismatch_.count(constraints->computation()) == 0 &&
+          (conditional_mismatch_.count(computation) == 0 &&
            constraints->computation_constraint().parameter_layout_is_set())) {
         const ShapeLayout& parameter_layout =
             constraints->computation_layout().parameter_layout(
@@ -775,6 +776,37 @@ Status LayoutAssignment::AddMandatoryConstraints(
               ->LayoutShapeForChannel(buffer_shape, channel_id);
       TF_RETURN_IF_ERROR(SetInstructionLayout(new_buffer_shape, instruction));
     } else if (instruction->preserve_layout()) {
+      TF_RETURN_IF_ERROR(SetInstructionLayout(instruction->shape(), instruction,
+                                              /*mandatory=*/true, /*dfs=*/true,
+                                              /*allow_alias=*/true));
+    } else if (instruction->opcode() == HloOpcode::kAsyncStart &&
+               (instruction->async_wrapped_opcode() == HloOpcode::kCall ||
+                instruction->async_wrapped_opcode() ==
+                    HloOpcode::kCustomCall) &&
+               instruction->async_execution_thread() !=
+                   computation->execution_thread()) {
+      HloInstruction* async_instruction =
+          instruction->async_wrapped_instruction();
+      // Until b/328820089 is resolved, we need to extract the layout
+      // constraints from the async call, rather than the wrapped computation's
+      // parameters.
+      std::vector<Shape> async_shapes;
+      if (IsLayoutConstrainedCustomCall(async_instruction)) {
+        const HloCustomCallInstruction* custom_call =
+            DynCast<HloCustomCallInstruction>(async_instruction);
+        async_shapes = custom_call->operand_shapes_with_layout();
+      } else {
+        async_shapes = async_instruction->called_computations()[0]
+                           ->ComputeProgramShape()
+                           .parameters();
+      }
+      for (int64_t i = 0; i < instruction->operand_count(); ++i) {
+        TF_RETURN_IF_ERROR(SetOperandLayout(async_shapes[i], instruction, i,
+                                            /*mandatory=*/true, /*dfs=*/false));
+      }
+      // The current logic buffer is aliased to the old operands, which at this
+      // point have been replaced by copies, so we need to send the old operand
+      // layout. This however sets the expected layout for the resulting buffer.
       TF_RETURN_IF_ERROR(SetInstructionLayout(instruction->shape(), instruction,
                                               /*mandatory=*/true, /*dfs=*/true,
                                               /*allow_alias=*/true));
@@ -2550,6 +2582,8 @@ absl::StatusOr<bool> LayoutAssignment::Run(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
   VLOG(2) << "Running layout assignment on module " << module->name();
+  VLOG(3) << "Pre LayoutAssignment:";
+  XLA_VLOG_LINES(3, module->ToString());
   TF_RETURN_IF_ERROR(Init(module));
   call_graph_ = CallGraph::Build(module);
   // Add copy to the operand of Send instructions, since we cannot call
@@ -2590,6 +2624,23 @@ absl::StatusOr<bool> LayoutAssignment::Run(
             TF_RETURN_IF_ERROR(AddCopyForOperand(instruction, operand_no));
             processed.insert(operand_no);
           }
+        }
+      }
+    }
+  }
+
+  // For similar reasons to custom-calls, add copies for operands of async
+  // calls, since we do not run layout assignment across thread boundaries.
+  for (HloComputation* computation : module->computations(execution_threads)) {
+    for (HloInstruction* instruction :
+         computation->MakeInstructionPostOrder()) {
+      if (instruction->opcode() == HloOpcode::kAsyncStart &&
+          (instruction->async_wrapped_opcode() == HloOpcode::kCall ||
+           instruction->async_wrapped_opcode() == HloOpcode::kCustomCall) &&
+          !execution_threads.contains(instruction->async_execution_thread())) {
+        for (int operand_no = 0; operand_no < instruction->operand_count();
+             ++operand_no) {
+          TF_RETURN_IF_ERROR(AddCopyForOperand(instruction, operand_no));
         }
       }
     }
@@ -2756,6 +2807,8 @@ absl::StatusOr<bool> LayoutAssignment::Run(
   TF_RETURN_IF_ERROR(PropagateComputationLayouts(module->entry_computation(),
                                                  entry_computation_layout_));
 
+  VLOG(3) << "Post LayoutAssignment:";
+  XLA_VLOG_LINES(3, module->ToString());
   TF_RETURN_IF_ERROR(CheckLayouts(module, execution_threads));
 
   // All layouts are reset then reassigned by this pass.
